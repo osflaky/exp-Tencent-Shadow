@@ -1,0 +1,99 @@
+name: pre-build
+description: '准备构建环境'
+runs:
+  using: "composite"
+  steps:
+    - name: revert gradle distributionUrl in every gradle-wrapper.properties
+      shell: bash
+      # BSD sed on macOS treats the argument after -i as a backup suffix, so
+      # "sed -i 's/..../g' file" fails there. Rewrite via a temp file instead,
+      # which behaves the same with GNU sed and BSD sed.
+      run: |
+        git grep -l 'mirrors.tencent.com/gradle' -- gradle-wrapper.properties '**/gradle-wrapper.properties' | while IFS= read -r f; do
+          sed 's/mirrors.tencent.com\/gradle/services.gradle.org\/distributions/g' "$f" > "$f.tmp"
+          mv "$f.tmp" "$f"
+        done
+    - name: Inject slug/short variables
+      uses: rlespinasse/github-slug-action@v3.x
+    - name: revert gradle wrapper mirror setting
+      shell: bash
+      run: echo "DISABLE_TENCENT_MAVEN_MIRROR=true" >> $GITHUB_ENV
+    # Temurin publishes no Windows aarch64 builds of JDK 11/17, so on
+    # Windows ARM64 runners use the Microsoft Build of OpenJDK, which does.
+    - uses: actions/setup-java@v4
+      with:
+        distribution: ${{ (runner.os == 'Windows' && runner.arch == 'ARM64') && 'microsoft' || 'temurin' }}
+        java-version: '17'
+        cache: 'gradle'
+    # Some runner images (e.g. ubuntu-24.04-arm) ship without a preinstalled
+    # Android SDK, so ANDROID_HOME is unset and sdkmanager is missing.
+    # The cmdline-tools are pure Java, so install them there.
+    - name: Install Android cmdline-tools if missing
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          SDKMANAGER_NAME="sdkmanager.bat"
+          TOOLS_PLATFORM="win"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          SDKMANAGER_NAME="sdkmanager"
+          TOOLS_PLATFORM="mac"
+        else
+          SDKMANAGER_NAME="sdkmanager"
+          TOOLS_PLATFORM="linux"
+        fi
+        if [ -n "$ANDROID_HOME" ] && [ -f "$ANDROID_HOME/cmdline-tools/latest/bin/$SDKMANAGER_NAME" ]; then
+          echo "Using preinstalled Android SDK at $ANDROID_HOME"
+          exit 0
+        fi
+        SDK_DIR="$HOME/android-sdk"
+        mkdir -p "$SDK_DIR/cmdline-tools"
+        TMP_DIR="$(mktemp -d)"
+        curl -fsSL -o "$TMP_DIR/cmdline-tools.zip" "https://dl.google.com/android/repository/commandlinetools-${TOOLS_PLATFORM}-11076708_latest.zip"
+        unzip -q "$TMP_DIR/cmdline-tools.zip" -d "$TMP_DIR"
+        rm -rf "$SDK_DIR/cmdline-tools/latest"
+        mv "$TMP_DIR/cmdline-tools" "$SDK_DIR/cmdline-tools/latest"
+        rm -rf "$TMP_DIR"
+        SDK_DIR_NATIVE="$SDK_DIR"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          SDK_DIR_NATIVE="$(cygpath -w "$SDK_DIR")"
+        fi
+        (yes || true) | "$SDK_DIR/cmdline-tools/latest/bin/$SDKMANAGER_NAME" --sdk_root="$SDK_DIR_NATIVE" --licenses > /dev/null
+        echo "ANDROID_HOME=$SDK_DIR_NATIVE" >> "$GITHUB_ENV"
+        echo "ANDROID_SDK_ROOT=$SDK_DIR_NATIVE" >> "$GITHUB_ENV"
+    # Google only publishes x86_64 Linux builds of AAPT2 (the one the Android
+    # Gradle Plugin downloads from Maven). On Linux arm64 runners, register
+    # qemu user-mode emulation for x86_64 ELF binaries and provide an amd64
+    # glibc sysroot so AAPT2 can run transparently.
+    - name: Enable x86_64 emulation for AAPT2 on Linux arm64
+      if: runner.os == 'Linux' && runner.arch == 'ARM64'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          qemu-user-static binfmt-support \
+          libc6-amd64-cross libgcc-s1-amd64-cross libstdc++6-amd64-cross
+        if [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
+          sudo systemctl restart systemd-binfmt || true
+        fi
+        if [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
+          docker run --privileged --rm tonistiigi/binfmt --install amd64
+        fi
+        cat /proc/sys/fs/binfmt_misc/qemu-x86_64
+        SYSROOT=/usr/x86_64-linux-gnu
+        sudo mkdir -p /lib64
+        if [ ! -e /lib64/ld-linux-x86-64.so.2 ]; then
+          sudo ln -sf "$SYSROOT/lib64/ld-linux-x86-64.so.2" /lib64/ld-linux-x86-64.so.2 2>/dev/null \
+            || sudo ln -sf "$SYSROOT/lib/ld-linux-x86-64.so.2" /lib64/ld-linux-x86-64.so.2
+        fi
+        echo "QEMU_LD_PREFIX=$SYSROOT" >> "$GITHUB_ENV"
+    - name: Add cmdline-tools to PATH
+      shell: bash
+      run: echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+    - name: Install specific Android SDK platforms
+      shell: bash
+      run: |
+        SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          SDKMANAGER="$SDKMANAGER.bat"
+        fi
+        "$SDKMANAGER" "platforms;android-33"
