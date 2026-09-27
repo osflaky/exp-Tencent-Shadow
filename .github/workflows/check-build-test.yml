@@ -1,0 +1,81 @@
+name: Check & Build & Test
+on:
+  workflow_dispatch:
+
+jobs:
+  check-commit-message:
+    name: 提交日志格式化检查
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: wagoid/commitlint-github-action@v6
+      with:
+        configFile: ./.commitlintrc.yml
+  check-code-format:
+    name: 代码格式化检查
+    runs-on: ubuntu-22.04
+    env:
+      AndroidStudioVersion: 2021.1.1.20
+    steps:
+    - name: checkout
+      uses: actions/checkout@v4
+    - name: Cache android-studio
+      id: cache-android-studio
+      uses: actions/cache@v4
+      with:
+        path: android-studio
+        key: ${{ runner.os }}-android-studio--${{ env.AndroidStudioVersion }}
+    - name: download android-studio
+      if: steps.cache-android-studio.outputs.cache-hit != 'true'
+      run: |
+        wget "https://redirector.gvt1.com/edgedl/android/studio/ide-zips/$AndroidStudioVersion/android-studio-$AndroidStudioVersion-linux.tar.gz"
+        tar -xvzf "android-studio-$AndroidStudioVersion-linux.tar.gz"
+        rm -rf "android-studio-$AndroidStudioVersion-linux.tar.gz"
+    - name: use android-studio format all files
+      run: ./android-studio/bin/format.sh -s .idea/codeStyles/Project.xml -r -m 
+        \*.java,\*.kt,\*.xml .
+    - name: show diff for files not formated
+      run: |
+        if ! git diff --quiet; then
+          git diff --exit-code
+        fi
+  build-sample-maven:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          java: 11
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest-11-arm64
+    needs: [check-commit-message, check-code-format]
+    name: 构建maven依赖SDK的sample [${{ matrix.expander_leg }}]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - name: checkout
+      uses: actions/checkout@v4
+    - name: pre-build
+      uses: ./.github/actions/pre-build
+      # Temurin publishes no Windows aarch64 builds of JDK 11/17; the
+      # Microsoft Build of OpenJDK covers Windows ARM64 for all versions used.
+    - uses: actions/setup-java@v4
+      with:
+        distribution: ${{ (runner.os == 'Windows' && runner.arch == 'ARM64') && 
+          'microsoft' || 'temurin' }}
+        java-version: '${{ matrix.java }}'
+        cache: 'gradle'
+    - name: build sample/maven/host-project
+      working-directory: projects/sample/maven/host-project
+      run: ./gradlew assemble
+    - name: build sample/maven/manager-project
+      working-directory: projects/sample/maven/manager-project
+      run: ./gradlew assemble
+    - name: build sample/maven/plugin-project
+      working-directory: projects/sample/maven/plugin-project
+      run: ./gradlew assemble
+    - name: post-build
+      uses: ./.github/actions/post-build
+    timeout-minutes: 150
